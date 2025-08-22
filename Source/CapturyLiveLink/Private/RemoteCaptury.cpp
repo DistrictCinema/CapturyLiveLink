@@ -1,6 +1,9 @@
 #if 1
 #include "RemoteCaptury.h"
 
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -206,48 +209,14 @@ struct SyncSample {
 	SyncSample(uint64_t l, uint64_t r, uint32_t pp) : localT(l), remoteT(r), pingPongT(pp) {}
 };
 
-#ifdef WIN32
-static inline void lockMutex(CRITICAL_SECTION* critsec)
-{
-	EnterCriticalSection(critsec);
-}
-static inline void unlockMutex(CRITICAL_SECTION* critsec)
-{
-	LeaveCriticalSection(critsec);
-}
-#else
-static inline void lockMutex(MutexStruct* mtx) ACQUIRE(mtx)
-{
-	mtx->lock();
-}
-static inline void unlockMutex(MutexStruct* mtx) RELEASE(mtx)
-{
-	mtx->unlock();
-}
-// #define unlockMutex(mtx)	printf("unlocked %p at %d\n", mtx, __LINE__); (mtx)->unlock()
-// #define lockMutex(mtx)		printf("  locked %p at %d\n", mtx, __LINE__); (mtx)->lock()
-#endif
-
-
 struct RemoteCaptury {
-	#ifdef WIN32
-	HANDLE			streamThread;
-	HANDLE			receiveThread;
-	HANDLE			syncThread;
-	CRITICAL_SECTION	mutex;
-	CRITICAL_SECTION	partialActorMutex;
-	CRITICAL_SECTION	syncMutex;
-	CRITICAL_SECTION	logMutex;
-	bool mutexesInited = false;
-	#else
-	pthread_t	streamThread;
-	pthread_t	receiveThread;
-	pthread_t	syncThread;
-	MutexStruct	mutex;
-	MutexStruct	partialActorMutex;
-	MutexStruct	syncMutex;
-	MutexStruct	logMutex;
-	#endif
+	std::thread streamThread;
+	std::thread receiveThread;
+	std::thread syncThread;
+	std::mutex mainMutex;
+	std::mutex partialActorMutex;
+	std::mutex syncMutex;
+	std::mutex logMutex;
 
 	bool syncLoopIsRunning = false;
 
@@ -260,11 +229,11 @@ struct RemoteCaptury {
 	std::string currentShot;
 
 	// actor id -> pointer to actor
-	std::unordered_map<int, CapturyActor_p> actorsById GUARDED_BY(mutex);
-	std::unordered_map<const CapturyActor*, CapturyActor_p> returnedActors GUARDED_BY(mutex);
+	std::unordered_map<int, CapturyActor_p> actorsById GUARDED_BY(mainMutex);
+	std::unordered_map<const CapturyActor*, CapturyActor_p> returnedActors GUARDED_BY(mainMutex);
 	std::unordered_map<int, CapturyActor_p> partialActors GUARDED_BY(partialActorMutex); // actors that have been received in part
-	std::vector<CapturyActor> actorPointers GUARDED_BY(mutex); // used by Captury_getActors()
-	std::vector<CapturyActor_p> actorSharedPointers GUARDED_BY(mutex); // used by Captury_getActors()
+	std::vector<CapturyActor> actorPointers GUARDED_BY(mainMutex); // used by Captury_getActors()
+	std::vector<CapturyActor_p> actorSharedPointers GUARDED_BY(mainMutex); // used by Captury_getActors()
 
 	std::unordered_map<int, std::vector<CapturyAngleData>> currentAngles;
 
@@ -282,7 +251,7 @@ struct RemoteCaptury {
 	int framerateNumerator = -1;
 	int framerateDenominator = -1;
 
-	std::unordered_map<int, ActorData> actorData GUARDED_BY(mutex);
+	std::unordered_map<int, ActorData> actorData GUARDED_BY(mainMutex);
 
 	std::map<int32_t, CapturyImage> currentImages;
 	std::map<int32_t, std::vector<int>> currentImagesReceivedPackets;
@@ -311,12 +280,11 @@ struct RemoteCaptury {
 	CapturyImageCallback imageCallback = NULL;
 	void* imageArg = NULL;
 
-	volatile bool	handshakeFinished = false;
-	volatile bool	isStreamThreadRunning = false;
+	std::atomic<bool> handshakeFinished {false};
 	SOCKET		sock = (SOCKET)-1;
 
-	volatile int	stopStreamThread = 0; // stop streaming thread
-	volatile int	stopReceiving = 0; // stop receiving thread
+	std::atomic<int> stopStreamThread {0}; // stop streaming thread
+	std::atomic<int> stopReceiving {0}; // stop receiving thread
 
 	sockaddr_in	localAddress; // local address
 	sockaddr_in	localStreamAddress; // local address for streaming socket
@@ -357,13 +325,8 @@ struct RemoteCaptury {
 	void updateSync(uint64_t localT);
 	uint64_t getRemoteTime(uint64_t localT);
 
-	#ifdef WIN32
-	DWORD receiveLoop();
-	DWORD streamLoop(CapturyStreamPacketTcp* packet);
-	#else
-	void* receiveLoop();
-	void* streamLoop(CapturyStreamPacketTcp* packet);
-	#endif
+	void receiveLoop();
+	void streamLoop(CapturyStreamPacketTcp* packet);
 	void receivedPose(CapturyPose* pose, int actorId, ActorData* aData, uint64_t timestamp);
 	void receivedPosePacket(CapturyPosePacket* cpp);
 	SOCKET openTcpSocket();
@@ -380,28 +343,17 @@ struct RemoteCaptury {
 
 void RemoteCaptury::actualLog(int logLevel, const char* format, va_list args)
 {
-	#ifdef WIN32
-	if (!mutexesInited) {
-		InitializeCriticalSection(&mutex);
-		InitializeCriticalSection(&partialActorMutex);
-		InitializeCriticalSection(&syncMutex);
-		InitializeCriticalSection(&logMutex);
-		mutexesInited = true;
-	}
-	#endif
-
 	char buffer[509];
 	vsnprintf(buffer + 9, 500, format, args);
 
 	if (doPrintf)
 		printf("%s", buffer + 9);
 
-	lockMutex(&logMutex);
+	std::lock_guard<std::mutex> logLock(logMutex);
 	logs.emplace_back(buffer + 9);
 
 	if (logs.size() > 100000)
 		logs.pop_front();
-	unlockMutex(&logMutex);
 
 	if (doRemoteLogging && sock != -1) {
 		CapturyLogPacket* lp = (CapturyLogPacket*)buffer;
@@ -440,15 +392,13 @@ void Captury_enableRemoteLogging(RemoteCaptury* rc, int on)
 
 const char* Captury_getNextLogMessage(RemoteCaptury* rc)
 {
-	lockMutex(&rc->logMutex);
+	std::lock_guard<std::mutex> logLock(rc->logMutex);
 	if (rc->logs.empty()) {
-		unlockMutex(&rc->logMutex);
 		return nullptr;
 	}
 
 	const char* str = strdup(rc->logs.front().c_str());
 	rc->logs.pop_front();
-	unlockMutex(&rc->logMutex);
 
 	return str;
 }
@@ -751,7 +701,7 @@ void RemoteCaptury::updateSync(uint64_t localT)
 	Sync tempSync(0.0, 1.0);
 	computeSync(tempSync);
 
-	lockMutex(&syncMutex);
+	std::lock_guard<std::mutex> syncLock(syncMutex);
 	transitionStartLocalT = localT;
 
 	// transitionFactor = std::abs(transitionStartRemoteT - remoteT) / defaultTransitionTime;
@@ -764,24 +714,21 @@ void RemoteCaptury::updateSync(uint64_t localT)
 
 	double delta = transitionStartRemoteT - currentSync.getRemoteTime(localT);
 	double factor = currentSync.factor;
-	unlockMutex(&syncMutex);
 
 	log("sync: old - new estimate %g (factor %g)\n", delta, factor);
 }
 
 uint64_t RemoteCaptury::getRemoteTime(uint64_t localT)
 {
-	lockMutex(&syncMutex);
+	std::lock_guard<std::mutex> syncLock(syncMutex);
 	if (localT >= transitionEndLocalT) {
 		uint64_t t = currentSync.getRemoteTime(localT);
-		unlockMutex(&syncMutex);
 		return t;
 	}
 
 	uint64_t oldEstimate = oldSync.getRemoteTime(localT);
 	uint64_t newEstimate = currentSync.getRemoteTime(localT);
 	double at = double(localT - transitionStartLocalT) / (transitionEndLocalT - transitionStartLocalT);
-	unlockMutex(&syncMutex);
 	// log("sync: local %" PRIu64 " old %" PRIu64 " new %" PRIu64 " -> %" PRIu64 "\n", localT, oldEstimate, newEstimate, (uint64_t)(oldEstimate * (1.0 - at) + newEstimate * at));
 	return (uint64_t)(oldEstimate * (1.0 - at) + newEstimate * at);
 }
@@ -791,8 +738,10 @@ extern "C" uint64_t Captury_getTime(RemoteCaptury* rc)
 	return rc->getRemoteTime(getTime());
 }
 
-void RemoteCaptury::receivedPose(CapturyPose* pose, int actorId, ActorData* aData, uint64_t timestamp) REQUIRES(mutex)
+void RemoteCaptury::receivedPose(CapturyPose* pose, int actorId, ActorData* aData, uint64_t timestamp)
 {
+	std::unique_lock<std::mutex> mainLock(mainMutex);
+	
 	if (aData->status == ACTOR_DELETED)
 		return;
 
@@ -811,9 +760,9 @@ void RemoteCaptury::receivedPose(CapturyPose* pose, int actorId, ActorData* aDat
 	if (aData->status != ACTOR_SCALING && aData->status != ACTOR_TRACKING) {
 		aData->status = ACTOR_TRACKING;
 		if (actorChangedCallback) {
-			unlockMutex(&mutex);
+			mainLock.unlock();
 			actorChangedCallback(this, actorId, ACTOR_TRACKING, actorChangedArg);
-			lockMutex(&mutex);
+			mainLock.lock();
 		}
 	}
 
@@ -821,9 +770,9 @@ void RemoteCaptury::receivedPose(CapturyPose* pose, int actorId, ActorData* aDat
 		CapturyActor_p a = actorsById[actorId];
 		CapturyActor* actor = a.get();
 		returnedActors[actor] = a;
-		unlockMutex(&mutex);
+		mainLock.unlock();
 		newPoseCallback(this, actor, pose, aData->trackingQuality, newPoseArg);
-		lockMutex(&mutex);
+		mainLock.lock();
 	}
 
 	// mark actors as stopped if no data was received for a while
@@ -840,10 +789,12 @@ void RemoteCaptury::receivedPose(CapturyPose* pose, int actorId, ActorData* aDat
 		}
 	}
 
-	unlockMutex(&mutex);
+	mainLock.unlock();
 	for (int id : stoppedActorIds)
+	{
 		actorChangedCallback(this, id, ACTOR_STOPPED, actorChangedArg);
-	lockMutex(&mutex);
+	}
+	mainLock.lock();
 }
 
 static void decompressPose(CapturyPose* pose, uint8_t* v, CapturyActor* actor)
@@ -901,12 +852,11 @@ static void decompressPose(CapturyPose* pose, uint8_t* v, CapturyActor* actor)
 
 void RemoteCaptury::receivedPosePacket(CapturyPosePacket* cpp)
 {
-	lockMutex(&mutex);
+	std::unique_lock<std::mutex> mainLock(mainMutex);
 	if (actorsById.count(cpp->actor) == 0) {
 		char buff[400];
 		snprintf(buff, 400, "Actor %x does not exist", cpp->actor);
 		lastErrorMessage = buff;
-		unlockMutex(&mutex);
 		return;
 	}
 
@@ -953,7 +903,6 @@ void RemoteCaptury::receivedPosePacket(CapturyPosePacket* cpp)
 				log("expected 3+%d+%d dofs, got %d\n", actor->numJoints*3, actor->numBlendShapes, numValues);
 			else
 				log("expected %d+%d dofs, got %d\n", actor->numJoints*6, actor->numBlendShapes, numValues);
-			unlockMutex(&mutex);
 			return;
 		}
 	}
@@ -1013,10 +962,10 @@ void RemoteCaptury::receivedPosePacket(CapturyPosePacket* cpp)
 		it->second.inProgress[inProgressIndex].onlyRootTranslation = onlyRootTranslation;
 	}
 
-	if (done)
+	if (done) {
+		mainLock.unlock();
 		receivedPose(&it->second.currentPose, cpp->actor, &it->second, cpp->timestamp);
-
-	unlockMutex(&mutex);
+	}
 }
 
 SOCKET RemoteCaptury::openTcpSocket()
@@ -1262,16 +1211,15 @@ bool RemoteCaptury::receive(SOCKET& sok)
 			p->type = capturyActor;
 			if (numTransmittedJoints == actor->numJoints) {
 				//log("received fulll actor %d\n", actor->id);
-				lockMutex(&mutex);
+				std::unique_lock<std::mutex> mainLock(mainMutex);
 				actorsById[actor->id] = actor;
 				CapturyActorStatus status = actorData[actor->id].status;
-				unlockMutex(&mutex);
+				mainLock.unlock();
 				if (actorChangedCallback)
 					actorChangedCallback(this, actor->id, status, actorChangedArg);
 			} else {
-				lockMutex(&partialActorMutex);
+				std::lock_guard<std::mutex> partialActorLock(partialActorMutex);
 				partialActors[actor->id] = actor;
-				unlockMutex(&partialActorMutex);
 			}
 			break; }
 		case capturyActorContinued:
@@ -1279,14 +1227,13 @@ bool RemoteCaptury::receive(SOCKET& sok)
 		case capturyActorContinued3: {
 			int version = (p->type == capturyActor) ? 1 : (p->type == capturyActor2) ? 2 : 3;
 			CapturyActorContinuedPacket* cacp = (CapturyActorContinuedPacket*)p;
-			lockMutex(&partialActorMutex);
+			std::unique_lock<std::mutex> partialActorLock(partialActorMutex);
 			if (partialActors.count(cacp->id) == 0) {
-				unlockMutex(&partialActorMutex);
 				break;
 			}
 
 			CapturyActor_p actor = partialActors[cacp->id];
-			unlockMutex(&partialActorMutex);
+			partialActorLock.unlock();
 
 			int j = cacp->startJoint;
 			switch (version) {
@@ -1338,15 +1285,16 @@ bool RemoteCaptury::receive(SOCKET& sok)
 			}
 			if (j == actor->numJoints) {
 				// log("received fulll actor %d\n", actor->id);
-				lockMutex(&mutex);
+				std::unique_lock<std::mutex> mainLock(mainMutex);
 				actorsById[actor->id] = actor;
 				CapturyActorStatus status = actorData[actor->id].status;
-				unlockMutex(&mutex);
 				if (actorChangedCallback)
+				{
+					mainLock.unlock();
 					actorChangedCallback(this, actor->id, status, actorChangedArg);
-				lockMutex(&partialActorMutex);
+					mainLock.lock();
+				}
 				partialActors.erase(actor->id);
-				unlockMutex(&partialActorMutex);
 			} else {
 				// expect is already set correctly
 				// numRetries += 1;
@@ -1356,7 +1304,7 @@ bool RemoteCaptury::receive(SOCKET& sok)
 			break; }
 		case capturyActorBlendShapes: {
 			CapturyActorBlendShapesPacket* cabs = (CapturyActorBlendShapesPacket*)p;
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			CapturyActor_p actor = actorsById[cabs->actorId];
 			actor->numBlendShapes = cabs->numBlendShapes;
 			actor->blendShapes = new CapturyBlendShape[actor->numBlendShapes];
@@ -1366,11 +1314,10 @@ bool RemoteCaptury::receive(SOCKET& sok)
 				actor->blendShapes[i].name[63] = '\0';
 				at += std::min<int>((int)strlen(actor->blendShapes[i].name) + 1, 64);
 			}
-			unlockMutex(&mutex);
 			break; }
 		case capturyActorMetaData: {
 			CapturyActorMetaDataPacket* cmd = (CapturyActorMetaDataPacket*)p;
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			CapturyActor_p actor = actorsById[cmd->actorId];
 			actor->numMetaData = cmd->numEntries;
 			actor->metaDataKeys = new char*[actor->numMetaData];
@@ -1382,15 +1329,13 @@ bool RemoteCaptury::receive(SOCKET& sok)
 				actor->metaDataValues[i] = strdup(at);
 				at += strlen(actor->metaDataValues[i]) + 1;
 			}
-			unlockMutex(&mutex);
 			break; }
 		case capturyBoneTypes: {
 			CapturyBoneTypePacket* cbt = (CapturyBoneTypePacket*)p;
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			CapturyActor_p actor = actorsById[cbt->actorId];
 			for (int i = 0; i < std::min<int>(actor->numJoints, size - sizeof(CapturyBoneTypePacket)); ++i)
 				actor->joints[i].boneType = cbt->boneTypes[i];
-			unlockMutex(&mutex);
 			break; }
 		case capturyCamera: {
 			CapturyCamera camera;
@@ -1411,9 +1356,8 @@ bool RemoteCaptury::receive(SOCKET& sok)
 
 			// TODO compute extrinsic and intrinsic matrix
 
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			cameras.push_back(camera);
-			unlockMutex(&mutex);
 			break; }
 		case capturyPose:
 		case capturyPose2:
@@ -1462,7 +1406,7 @@ bool RemoteCaptury::receive(SOCKET& sok)
 			CapturyImageHeaderPacket* tp = (CapturyImageHeaderPacket*)p;
 
 			// update the image structures
-			lockMutex(&mutex);
+			std::unique_lock<std::mutex> mainLock(mainMutex);
 			if (actorData.count(tp->actor) > 0) {
 				free(actorData[tp->actor].currentTextures.data);
 				actorData[tp->actor].currentTextures.data = NULL;
@@ -1474,7 +1418,7 @@ bool RemoteCaptury::receive(SOCKET& sok)
 //			log("got image header %dx%d for actor %x\n", currentTextures[tp->actor].width, currentTextures[tp->actor].height, tp->actor);
 			actorData[tp->actor].currentTextures.data = (unsigned char*)malloc(tp->width*tp->height*3);
 			actorData[tp->actor].receivedPackets = std::vector<int>( ((tp->width*tp->height*3 + tp->dataPacketSize-16-1) / (tp->dataPacketSize-16)), 0);
-			unlockMutex(&mutex);
+			mainLock.unlock();
 
 			// and request the data to go with it
 			if (sock == -1 || streamSocketPort == 0)
@@ -1505,10 +1449,9 @@ bool RemoteCaptury::receive(SOCKET& sok)
 			break; }
 		case capturyScalingProgress: {
 			CapturyScalingProgressPacket* spp = (CapturyScalingProgressPacket*)p;
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			if (actorData.count(spp->actor))
 				actorData[spp->actor].scalingProgress = spp->progress;
-			unlockMutex(&mutex);
 			break; }
 		case capturyBackgroundQuality: {
 			CapturyBackgroundQualityPacket* bqp = (CapturyBackgroundQualityPacket*)p;
@@ -1526,10 +1469,9 @@ bool RemoteCaptury::receive(SOCKET& sok)
 			CapturyActorModeChangedPacket* amc = (CapturyActorModeChangedPacket*)p;
 			if (actorChangedCallback != NULL)
 				actorChangedCallback(this, amc->actor, amc->mode, actorChangedArg);
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			if (actorData.count(amc->actor))
 				actorData[amc->actor].status = (CapturyActorStatus)amc->mode;
-			unlockMutex(&mutex);
 			break; }
 		case capturyStreamAck:
 		case capturySetShotAck:
@@ -1556,7 +1498,7 @@ bool RemoteCaptury::receive(SOCKET& sok)
 void RemoteCaptury::deleteActors()
 {
 	log("deleting all actors\n");
-	lockMutex(&mutex);
+	std::unique_lock<std::mutex> mainLock(mainMutex);
 	for (auto it : actorsById)
 		delete[] it.second->joints;
 	actorsById.clear();
@@ -1580,29 +1522,17 @@ void RemoteCaptury::deleteActors()
 			deletedActorIds.push_back(it->first);
 	}
 	actorData.clear();
-	unlockMutex(&mutex);
+	mainLock.unlock();
 
 	for (int id : deletedActorIds)
 		actorChangedCallback(this, id, ACTOR_DELETED, actorChangedArg);
 }
 
-#ifdef WIN32
-static DWORD WINAPI receiveLoop(void* arg)
-#else
-static void* receiveLoop(void* arg)
-#endif
-{
-	return ((RemoteCaptury*)arg)->receiveLoop();
-}
-
-#ifdef WIN32
-DWORD RemoteCaptury::receiveLoop()
-#else
-void* RemoteCaptury::receiveLoop()
-#endif
+void RemoteCaptury::receiveLoop()
 {
 	bool handshaking = !handshakeFinished;
 	log("starting receive loop\n");
+	
 	while (!stopReceiving && (!handshaking || !handshakeFinished)) {
 		if (!receive(sock)) {
 			if (sock == -1) {
@@ -1610,15 +1540,10 @@ void* RemoteCaptury::receiveLoop()
 				cameras.clear();
 				numCameras = -1;
 
-				if (isStreamThreadRunning) {
+				if (streamThread.joinable()) {
 					stopStreamThread = 1;
 
-					#ifdef WIN32
-					WaitForSingleObject(streamThread, 1000);
-					#else
-					void* retVal;
-					pthread_join(streamThread, &retVal);
-					#endif
+					streamThread.join();
 				}
 
 				while (!stopReceiving) {
@@ -1637,8 +1562,6 @@ void* RemoteCaptury::receiveLoop()
 		}
 	}
 	log("stopping receive loop\n");
-
-	return 0;
 }
 
 bool RemoteCaptury::sendPacket(CapturyRequestPacket* packet, CapturyPacketTypes expectedReplyType)
@@ -1649,44 +1572,32 @@ bool RemoteCaptury::sendPacket(CapturyRequestPacket* packet, CapturyPacketTypes 
 	return true;
 }
 
-#ifdef WIN32
-static DWORD WINAPI streamLoop(void* arg)
-#else
-static void* streamLoop(void* arg)
-#endif
+static void streamLoop(void* arg)
 {
 	RemoteCaptury** rc = (RemoteCaptury**)arg;
 	CapturyStreamPacketTcp* packet = (CapturyStreamPacketTcp*)&rc[1];
 	rc[0]->streamLoop(packet);
 	free(arg);
-	return 0;
 }
 
-#ifdef WIN32
-DWORD RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
-#else
-void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
-#endif
+void RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 {
-	isStreamThreadRunning = true;
-
-
 	SOCKET streamSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (streamSock == -1) {
 		log("failed to create stream socket\n");
-		return 0;
+		return;
 	}
 
 	if (bind(streamSock, (sockaddr*) &localStreamAddress, sizeof(localStreamAddress)) != 0) {
 		closesocket(streamSock);
 		log("failed to bind stream socket\n");
-		return 0;
+		return;
 	}
 
 	if (::connect(streamSock, (sockaddr*) &remoteAddress, sizeof(remoteAddress)) != 0) {
 		closesocket(streamSock);
 		log("failed to connect stream socket\n");
-		return 0;
+		return;
 	}
 
 	// send dummy packet to trick some firewalls into letting us through
@@ -1725,7 +1636,7 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 	// send request on TCP socket
 	if (send(sock, (const char*)packet, packet->size, 0) != packet->size) {
 		lastErrorMessage = "Failed to start streaming";
-		return 0;
+		return;
 	}
 
 	while (!stopStreamThread) {
@@ -1796,10 +1707,9 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			//log("received image data for actor %x (payload %d bytes)\n", cip->actor, cip->size-16);
 
 			// check if we have a texture already
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			std::unordered_map<int, ActorData>::iterator it = actorData.find(cip->actor);
 			if (it == actorData.end()) {
-				unlockMutex(&mutex);
 				log("received image data for actor %x without having received image header\n", cip->actor);
 				continue;
 			}
@@ -1809,7 +1719,6 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 
 			// check if packet fits
 			if (cip->offset >= imgSize || cip->offset + cip->size-16 > imgSize) {
-				unlockMutex(&mutex);
 				log("received image data for actor %x (%d-%d) that is larger than header (%dx%d*3 = %d)\n", cip->actor, cip->offset, cip->offset+cip->size-16, it->second.currentTextures.width, it->second.currentTextures.height, imgSize);
 				continue;
 			}
@@ -1820,7 +1729,6 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 
 			// copy data
 			memcpy(it->second.currentTextures.data + cip->offset, cip->data, cip->size-16);
-			unlockMutex(&mutex);
 
 			continue;
 		}
@@ -1829,7 +1737,7 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			CapturyImageHeaderPacket* tp = (CapturyImageHeaderPacket*)buffer.data();
 
 			// update the image structures
-			lockMutex(&mutex);
+			std::unique_lock<std::mutex> mainLock(mainMutex);
 			if (currentImages.count(tp->actor) == 0) {
 				currentImages[tp->actor].camera = tp->actor;
 				currentImages[tp->actor].width = tp->width;
@@ -1840,7 +1748,7 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 				currentImages[tp->actor].data = (unsigned char*)realloc(currentImages[tp->actor].data, tp->width*tp->height*3);
 
 			currentImagesReceivedPackets[tp->actor] = std::vector<int>( ((tp->width*tp->height*3 + tp->dataPacketSize-16-1) / (tp->dataPacketSize-16)) + 1, 0);
-			unlockMutex(&mutex);
+			mainLock.unlock();
 
 			// and request the data to go with it
 			if (sock != -1 && streamSocketPort != 0) {
@@ -1868,12 +1776,11 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			}
 
 			// copy data from packet into the buffer
-			lockMutex(&mutex);
+			std::unique_lock<std::mutex> mainLock(mainMutex);
 			const int imgSize = it->second.width * it->second.height * 3;
 
 			// check if packet fits
 			if (cip->offset >= imgSize || cip->offset + cip->size-16 > imgSize) {
-				unlockMutex(&mutex);
 				log("received image data for camera %d (%d-%d) that is larger than header (%dx%d*3 = %d)\n", cip->actor, cip->offset, cip->offset+cip->size-16, it->second.width, it->second.height, imgSize);
 				continue;
 			}
@@ -1917,10 +1824,13 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 				std::fill(recvd.begin(), recvd.end(), 0);
 				finished = true;
 			}
-			unlockMutex(&mutex);
 
 			if (finished && imageCallback)
+			{
+				mainLock.unlock();
 				imageCallback(this, &currentImagesDone[cip->actor], imageArg);
+				mainLock.lock();
+			}
 
 			continue;
 		}
@@ -1928,15 +1838,18 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 		if (cpp->type == capturyARTag) {
 			//log("received ARTag message\n");
 			CapturyARTagPacket* art = (CapturyARTagPacket*)buffer.data();
-			lockMutex(&mutex);
+			std::unique_lock<std::mutex> mainLock(mainMutex);
 			arTagsTime = getTime();
 			arTags.resize(art->numTags);
 			memcpy(&arTags[0], &art->tags[0], sizeof(CapturyARTag) * art->numTags);
 			//for (int i = 0; i < art->numTags; ++i)
 			//	log("  id %d: orient % 4.1f,% 4.1f,% 4.1f\n", art->tags[i].id, art->tags[i].transform.rotation[0], art->tags[i].transform.rotation[1], art->tags[i].transform.rotation[2]);
-			unlockMutex(&mutex);
 			if (arTagCallback != NULL)
+			{
+				mainLock.unlock();
 				arTagCallback(this, art->numTags, &art->tags[0], arTagArg);
+				mainLock.lock();
+			}
 			continue;
 		}
 
@@ -1944,11 +1857,10 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			CapturyAnglesPacket* ang = (CapturyAnglesPacket*)buffer.data();
 			if (newAnglesCallback != NULL)
 				newAnglesCallback(this, Captury_getActor(this, ang->actor), ang->numAngles, ang->angles, newAnglesArg);
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			currentAngles[ang->actor].resize(ang->numAngles);
 			for (int i = 0; i < ang->numAngles; ++i)
 				currentAngles[ang->actor][i] = *(CapturyAngleData*)((char*)ang->angles + sizeof(CapturyAngleData) * i);
-			unlockMutex(&mutex);
 			continue;
 		}
 
@@ -1957,19 +1869,17 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			log("received actorModeChanged packet %x %d\n", amc->actor, amc->mode);
 			if (actorChangedCallback != NULL)
 				actorChangedCallback(this, amc->actor, amc->mode, actorChangedArg);
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			if (actorData.count(amc->actor))
 				actorData[amc->actor].status = (CapturyActorStatus)amc->mode;
-			unlockMutex(&mutex);
 			continue;
 		}
 		if (cpp->type == capturyPoseCont || cpp->type == capturyCompressedPoseCont) {
-			lockMutex(&mutex);
+			std::unique_lock<std::mutex> mainLock(mainMutex);
 			if (actorsById.count(cpp->actor) == 0) {
 				char buff[400];
 				snprintf(buff, 400, "pose continuation: Actor %d does not exist", cpp->actor);
 				lastErrorMessage = buff;
-				unlockMutex(&mutex);
 				continue;
 			}
 
@@ -1984,7 +1894,6 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			}
 			if (inProgressIndex == -1) {
 				lastErrorMessage = "pose continuation packet for wrong timestamp";
-				unlockMutex(&mutex);
 				continue;
 			}
 
@@ -1996,7 +1905,6 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 			int totalBytes = (numJoints * 6 + numBlendShapes) * sizeof(float);
 			if (aData.inProgress[inProgressIndex].bytesDone + numBytesToCopy > totalBytes) {
 				lastErrorMessage = "pose continuation too large";
-				unlockMutex(&mutex);
 				continue;
 			}
 
@@ -2016,15 +1924,15 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 					memcpy(aData.currentPose.transforms, aData.inProgress[inProgressIndex].pose, numJoints * 6 * sizeof(float));
 					memcpy(aData.currentPose.blendShapeActivations, aData.inProgress[inProgressIndex].pose + numJoints * 6 * sizeof(float), numBlendShapes * sizeof(float));
 				}
+				mainLock.unlock();
 				receivedPose(&aData.currentPose, cpc->actor, &actorData[cpc->actor], aData.inProgress[inProgressIndex].timestamp);
 			}
-			unlockMutex(&mutex);
 			continue;
 		}
 
 		if (cpp->type == capturyLatency) {
 			CapturyLatencyPacket* lp = (CapturyLatencyPacket*)buffer.data();
-			lockMutex(&mutex);
+			std::lock_guard<std::mutex> mainLock(mainMutex);
 			currentLatency = *lp;
 			if (mostRecentPoseReceivedTimestamp == currentLatency.poseTimestamp) {
 				receivedPoseTime = mostRecentPoseReceivedTime;
@@ -2033,7 +1941,6 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 				receivedPoseTime = 0; // most recent one doesn't match
 				receivedPoseTimestamp = 0;
 			}
-			unlockMutex(&mutex);
 			log("latency received %" PRIu64 ", %" PRIu64 " - %" PRIu64 ", %" PRIu64 " - %" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n", lp->firstImagePacket, lp->optimizationStart, lp->optimizationEnd, lp->sendPacketTime, dataAvailableTime, dataReceivedTime, receivedPoseTime);
 			continue;
 		}
@@ -2046,14 +1953,11 @@ void* RemoteCaptury::streamLoop(CapturyStreamPacketTcp* packet)
 		receivedPosePacket(cpp);
 	}
 
-	isStreamThreadRunning = false;
-
 	closesocket(streamSock);
 
 	streamSocketPort = 0;
 
 	log("closing streaming thread\n");
-	return 0;
 }
 
 extern "C" RemoteCaptury* Captury_create()
@@ -2081,22 +1985,12 @@ extern "C" int Captury_connect2(RemoteCaptury* rc, const char* ip, unsigned shor
 
 bool RemoteCaptury::connect(const char* ip, unsigned short port, unsigned short localPort, unsigned short localStreamPort, int async)
 {
-#ifdef WIN32
-	if (!mutexesInited) {
-		InitializeCriticalSection(&mutex);
-		InitializeCriticalSection(&partialActorMutex);
-		InitializeCriticalSection(&syncMutex);
-		InitializeCriticalSection(&logMutex);
-		mutexesInited = true;
-	}
-#endif
-
 	struct in_addr addr;
 #ifdef WIN32
 	addr.S_un.S_addr = inet_addr(ip);
 #else
 	if (!inet_pton(AF_INET, ip, &addr))
-		return 0;
+		return false;
 #endif
 
 	if (sock != -1)
@@ -2128,19 +2022,15 @@ bool RemoteCaptury::connect(const char* ip, unsigned short port, unsigned short 
 #endif
 
 			if ((sock = openTcpSocket()) == -1)
-				return 0;
+				return false;
 		}
 
 		receiveLoop(); // block until handshake is finished
 	}
 
-#ifdef WIN32
-	receiveThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)::receiveLoop, this, 0, NULL);
-#else
-	pthread_create(&receiveThread, NULL, ::receiveLoop, this);
-#endif
+	receiveThread = std::thread(&RemoteCaptury::receiveLoop, this);
 
-	return 1;
+	return true;
 }
 
 // returns 1 if successful, 0 otherwise
@@ -2153,26 +2043,19 @@ extern "C" int Captury_disconnect(RemoteCaptury* rc)
 bool RemoteCaptury::disconnect()
 {
 	bool closedOrStopped = false;
+	
+	// Initialize threads to stop
+	stopReceiving = 1;
+	stopStreamThread = 1;
 
-	if (!stopReceiving) {
+	// Wait for threads to close if not closed already
+	if (receiveThread.joinable()) {
+		receiveThread.join();
 		handshakeFinished = false;
-		stopReceiving = 1;
-		stopStreamThread = 1;
-
-		#ifdef WIN32
-		if (wsaInited) {
-			WSACleanup();
-			wsaInited = false;
-		}
-
-		WaitForSingleObject(receiveThread, 1000);
-		WaitForSingleObject(streamThread, 1000);
-		#else
-		void* retVal;
-		pthread_join(receiveThread, &retVal);
-		pthread_join(streamThread, &retVal);
-		#endif
-
+		closedOrStopped = true;
+	}
+	if (streamThread.joinable()) {
+		streamThread.join();
 		closedOrStopped = true;
 	}
 
@@ -2201,7 +2084,7 @@ extern "C" int Captury_getConnectionStatus(RemoteCaptury* rc)
 // the array is owned by the library - do not free
 extern "C" int Captury_getActors(RemoteCaptury* rc, const CapturyActor** actrs)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 
 	rc->actorPointers.clear();
 	rc->actorPointers.reserve(rc->actorsById.size());
@@ -2218,19 +2101,17 @@ extern "C" int Captury_getActors(RemoteCaptury* rc, const CapturyActor** actrs)
 	}
 
 	*actrs = (numActors == 0) ? NULL : const_cast<const CapturyActor*>(rc->actorPointers.data());
-	unlockMutex(&rc->mutex);
 
 	return numActors;
 }
 
 extern "C" void Captury_freeActors(RemoteCaptury* rc)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 
 	rc->actorPointers.clear();
 	rc->actorSharedPointers.clear();
 
-	unlockMutex(&rc->mutex);
 }
 
 // returns the actor if found or NULL if not
@@ -2242,26 +2123,23 @@ extern "C" const CapturyActor* Captury_getActor(RemoteCaptury* rc, int id)
 	if (id == 0) // invalid id
 		return NULL;
 
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	if (rc->actorsById.count(id) == 0) {
-		unlockMutex(&rc->mutex);
 		return NULL;
 	}
 
 	CapturyActor_p ret = rc->actorsById[id];
 	rc->returnedActors[ret.get()] = ret;
-	unlockMutex(&rc->mutex);
 
 	return ret.get();
 }
 
 extern "C" void Captury_freeActor(RemoteCaptury* rc, const CapturyActor* actor)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	auto it = rc->returnedActors.find(actor);
 	if (it != rc->returnedActors.end())
 		rc->returnedActors.erase(it);
-	unlockMutex(&rc->mutex);
 }
 
 // returns the number of cameras
@@ -2283,9 +2161,8 @@ extern "C" int Captury_getCameras(RemoteCaptury* rc, const CapturyCamera** cams)
 	}
 
 	static std::vector<CapturyCamera> camerasBuffer;
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	camerasBuffer = rc->cameras;
-	unlockMutex(&rc->mutex);
 
 	if (camerasBuffer.empty())
 		*cams = NULL;
@@ -2297,11 +2174,10 @@ extern "C" int Captury_getCameras(RemoteCaptury* rc, const CapturyCamera** cams)
 // get the last error message
 char* Captury_getLastErrorMessage(RemoteCaptury* rc)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	char* msg = new char[rc->lastErrorMessage.size()+1];
 	memcpy(msg, &rc->lastErrorMessage[0], rc->lastErrorMessage.size());
 	msg[rc->lastErrorMessage.size()] = 0;
-	unlockMutex(&rc->mutex);
 
 	return msg;
 }
@@ -2346,7 +2222,7 @@ int RemoteCaptury::startStreamingImagesAndAngles(int what, int32_t camId, int nu
 	if (what == CAPTURY_STREAM_NOTHING)
 		return Captury_stopStreaming(this);
 
-	if (isStreamThreadRunning)
+	if (streamThread.joinable())
 		Captury_stopStreaming(this);
 
 	RemoteCaptury** rec = (RemoteCaptury**)malloc(sizeof(RemoteCaptury*) + sizeof(CapturyStreamPacketTcp) + (numAngles ? (2 + numAngles * 2) : 0));
@@ -2377,11 +2253,7 @@ int RemoteCaptury::startStreamingImagesAndAngles(int what, int32_t camId, int nu
 	packet->cameraId = camId;
 
 	stopStreamThread = 0;
-#ifdef WIN32
-	streamThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)::streamLoop, rec, 0, NULL);
-#else
-	pthread_create(&streamThread, NULL, ::streamLoop, rec);
-#endif
+	streamThread = std::thread(::streamLoop, rec);
 
 	return 1;
 }
@@ -2394,14 +2266,8 @@ extern "C" int Captury_stopStreaming(RemoteCaptury* rc, int wait)
 
 	rc->stopStreamThread = 1;
 
-	if (wait) {
-#ifdef WIN32
-		WaitForSingleObject(rc->streamThread, 1000);
-#else
-		void* retVal;
-		pthread_join(rc->streamThread, &retVal);
-#endif
-	}
+	if (wait && rc->streamThread.joinable())
+		rc->streamThread.join();
 
 	return 1;
 }
@@ -2421,10 +2287,11 @@ extern "C" CapturyPose* Captury_getCurrentPoseAndTrackingConsistencyForActor(Rem
 
 CapturyPose* RemoteCaptury::getCurrentPoseAndTrackingConsistencyForActor(int actorId, int* tc)
 {
+	std::unique_lock<std::mutex> mainLock(mainMutex);
+
 	// check whether any actor changed status
 	uint64_t now = getTime() - 500000; // half a second ago
 	bool stillCurrent = true;
-	lockMutex(&mutex);
 	std::vector<int> stoppedActorIds;
 	for (std::unordered_map<int, ActorData>::iterator it = actorData.begin(); it != actorData.end(); ++it) {
 		if (it->second.lastPoseTimestamp > now) // still current
@@ -2439,14 +2306,14 @@ CapturyPose* RemoteCaptury::getCurrentPoseAndTrackingConsistencyForActor(int act
 		}
 	}
 
-	unlockMutex(&mutex);
-	for (int id : stoppedActorIds)
+	for (int id : stoppedActorIds) {
+		mainLock.unlock();
 		actorChangedCallback(this, id, ACTOR_STOPPED, actorChangedArg);
-	lockMutex(&mutex);
+		mainLock.lock();
+	}
 
 	if (!stillCurrent) {
 		lastErrorMessage = "actor has disappeared";
-		unlockMutex(&mutex);
 		return NULL;
 	}
 
@@ -2460,12 +2327,10 @@ CapturyPose* RemoteCaptury::getCurrentPoseAndTrackingConsistencyForActor(int act
 			snprintf(buf, 400, "%d ", it->first);
 			lastErrorMessage += buf;
 		}
-		unlockMutex(&mutex);
 		return NULL;
 	}
 
 	if (it->second.currentPose.numTransforms == 0 && it->second.currentPose.numBlendShapes == 0) {
-		unlockMutex(&mutex);
 		lastErrorMessage = "most recent pose is empty";
 		return NULL;
 	}
@@ -2480,7 +2345,6 @@ CapturyPose* RemoteCaptury::getCurrentPoseAndTrackingConsistencyForActor(int act
 
 	memcpy(pose->transforms, it->second.currentPose.transforms, sizeof(CapturyTransform) * pose->numTransforms);
 	memcpy(pose->blendShapeActivations, it->second.currentPose.blendShapeActivations, sizeof(float) * pose->numBlendShapes);
-	unlockMutex(&mutex);
 
 	return pose;
 }
@@ -2533,31 +2397,27 @@ extern "C" void Captury_freePose(CapturyPose* pose)
 
 extern "C" int Captury_getActorStatus(RemoteCaptury* rc, int actorId)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	std::unordered_map<int, ActorData>::iterator it = rc->actorData.find(actorId);
 	if (it == rc->actorData.end()) {
-		unlockMutex(&rc->mutex);
 		return ACTOR_UNKNOWN;
 	}
 
 	CapturyActorStatus status = it->second.status;
-	unlockMutex(&rc->mutex);
 
 	return status;
 }
 
 extern "C" CapturyARTag* Captury_getCurrentARTags(RemoteCaptury* rc)
 {
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	uint64_t now = getTime();
-	lockMutex(&rc->mutex);
 	if (now > rc->arTagsTime + 100000) { // 100ms
-		unlockMutex(&rc->mutex);
 		return NULL;
 	}
 	int numARTags = (int)rc->arTags.size();
 	CapturyARTag* artags = (CapturyARTag*)malloc(sizeof(CapturyARTag) * (numARTags+1));
 	memcpy(artags, &rc->arTags[0], sizeof(CapturyARTag) * numARTags);
-	unlockMutex(&rc->mutex);
 
 	artags[numARTags].id = -1;
 	return artags;
@@ -2594,12 +2454,12 @@ extern "C" int Captury_requestTexture(RemoteCaptury* rc, int actorId)
 // returns a texture image of the specified actor
 extern "C" CapturyImage* Captury_getTexture(RemoteCaptury* rc, int actorId)
 {
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
+
 	// check if we don't have a texture yet
-	lockMutex(&rc->mutex);
 	std::unordered_map<int, ActorData>::iterator it = rc->actorData.find(actorId);
 	if (it == rc->actorData.end()) {
-		unlockMutex(&rc->mutex);
-		return 0;
+		return nullptr;
 	}
 
 	// create a copy of all data
@@ -2613,7 +2473,6 @@ extern "C" CapturyImage* Captury_getTexture(RemoteCaptury* rc, int actorId)
 	image->gpuData = nullptr;
 
 	memcpy(image->data, it->second.currentTextures.data, size);
-	unlockMutex(&rc->mutex);
 
 	return image;
 }
@@ -2661,22 +2520,19 @@ extern "C" uint64_t Captury_getMarkerTransform(RemoteCaptury* rc, int actorId, i
 
 extern "C" int Captury_getScalingProgress(RemoteCaptury* rc, int actorId)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	int scaling = rc->actorData.count(actorId) ? rc->actorData[actorId].scalingProgress : 0;
-	unlockMutex(&rc->mutex);
 	return scaling;
 }
 
 extern "C" int Captury_getTrackingQuality(RemoteCaptury* rc, int actorId)
 {
-	lockMutex(&rc->mutex);
+	std::lock_guard<std::mutex> mainLock(rc->mainMutex);
 	auto it = rc->actorData.find(actorId);
 	if (it == rc->actorData.end()) {
-		unlockMutex(&rc->mutex);
 		return 0;
 	}
 	int quality = it->second.trackingQuality;
-	unlockMutex(&rc->mutex);
 
 	return quality;
 }
@@ -2789,12 +2645,7 @@ extern "C" void Captury_startTimeSynchronizationLoop(RemoteCaptury* rc)
 	if (rc->syncLoopIsRunning)
 		return;
 
-#ifdef WIN32
-	rc->syncThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)syncLoop, rc, 0, NULL);
-#else
-	pthread_create(&rc->syncThread, NULL, syncLoop, rc);
-#endif
-
+	rc->syncThread = std::thread(syncLoop, rc);
 	rc->syncLoopIsRunning = true;
 }
 
@@ -2821,9 +2672,8 @@ extern "C" uint64_t Captury_synchronizeTime(RemoteCaptury* rc)
 
 extern "C" int64_t Captury_getTimeOffset(RemoteCaptury* rc)
 {
-	lockMutex(&rc->syncMutex);
+	std::lock_guard<std::mutex> syncLock(rc->syncMutex);
 	int64_t offset = (int64_t)rc->currentSync.offset;
-	unlockMutex(&rc->syncMutex);
 	return offset;
 }
 
