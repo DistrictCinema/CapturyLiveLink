@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 14,
+	"VersionName": "2025-06-17",
+	"FriendlyName": "CapturyLiveLink",
+	"Description": "Stream from Captury Live using the Live Link framework",
+	"Category": "Other",
+	"CreatedBy": "Captury",
+	"CreatedByURL": "https://captury.com",
+	"DocsURL": "http://doc.captury.com/CapturyLive/livestreaming.html",
+	"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/0db8152547a1458fa4c02899e17aa486",
+	"SupportURL": "",
+	"EngineVersion": "5.6.0",
+	"CanContainContent": false,
+	"Installed": true,
+	"Modules": [
+		{
+			"Name": "CapturyLiveLink",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Android",
+				"Linux",
+				"Mac"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "LiveLink",
+			"Enabled": true
+		}
+	]
+}
